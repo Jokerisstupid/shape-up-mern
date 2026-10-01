@@ -1,19 +1,57 @@
 import asyncHandler from "express-async-handler";
+import dns from "node:dns";
+
+// Windows / Node IPv6 connection drop fix
+dns.setDefaultResultOrder("ipv4first");
+
+let cachedModel = null;
+
+// Dynamic model discovery for your API key
+async function getAvailableModel(apiKey) {
+  if (cachedModel) return cachedModel;
+
+  try {
+    const listRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+    );
+    const listData = await listRes.json();
+
+    if (listData.models && Array.isArray(listData.models)) {
+      // Find an active model supporting generateContent (prioritizing 2.0-flash, flash, then any gemini)
+      const validModel = listData.models.find(
+        (m) =>
+          m.supportedGenerationMethods?.includes("generateContent") &&
+          (m.name.includes("2.0-flash") || m.name.includes("flash") || m.name.includes("gemini"))
+      );
+
+      if (validModel) {
+        cachedModel = validModel.name;
+        return cachedModel;
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ ListModels check skipped:", err.message);
+  }
+
+  // Safe fallback for v1beta
+  cachedModel = "models/gemini-2.0-flash";
+  return cachedModel;
+}
 
 const chatWithAI = asyncHandler(async (req, res) => {
   const { message, userData } = req.body;
-  
-  // 1. Load Key Securely
-  const API_KEY = process.env.GEMINI_API_KEY;
+
+  // 1. Load & sanitize key
+  const API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : null;
 
   if (!API_KEY) {
-      console.error("❌ CRITICAL: GEMINI_API_KEY is missing.");
-      return res.status(500).json({ reply: "System Error: API Key missing." });
+    console.error("❌ CRITICAL: GEMINI_API_KEY is missing.");
+    return res.status(500).json({ reply: "System Error: API Key missing." });
   }
 
   // 2. Prepare Context
   const name = userData?.name || "Athlete";
-  const goal = userData?.goal || "General Fitness"; 
+  const goal = userData?.goal || "General Fitness";
   const weight = userData?.weight ? `${userData.weight}kg` : "unknown weight";
 
   const systemInstruction = `
@@ -36,28 +74,14 @@ const chatWithAI = asyncHandler(async (req, res) => {
   `;
 
   try {
-    // 3. AUTO-DETECT MODEL (Your working logic)
-    // First, ask Google which models are active for this key
-    const modelListResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`);
-    const listData = await modelListResponse.json();
-    
-    if (listData.error) {
-        throw new Error(listData.error.message);
-    }
+    // 3. Resolve active model dynamically
+    let modelName = await getAvailableModel(API_KEY);
+    const cleanModel = modelName.startsWith("models/") ? modelName : `models/${modelName}`;
+    console.log(`🧠 AI Selected Model: ${cleanModel}`);
 
-    // Find a model that supports generating content (prefer Flash, then Pro)
-    const validModel = listData.models?.find(m => 
-        m.supportedGenerationMethods?.includes("generateContent") && 
-        (m.name.includes("flash") || m.name.includes("pro"))
-    );
-
-    // Default to a safe fallback if auto-detect fails
-    const modelName = validModel ? validModel.name : "models/gemini-1.5-flash";
-    console.log(`🧠 AI Selected Model: ${modelName}`);
-
-    // 4. GENERATE CONTENT (Direct Fetch)
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${API_KEY}`,
+    // 4. Generate Content
+    let response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${cleanModel}:generateContent?key=${API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -67,17 +91,35 @@ const chatWithAI = asyncHandler(async (req, res) => {
       }
     );
 
-    const data = await response.json();
-    
-    if (!response.ok) {
-        console.error("Google API Error:", JSON.stringify(data));
-        throw new Error(data.error?.message || "Google Refused Connection");
+    let data = await response.json();
+
+    // 5. Retry fallback with gemini-2.0-flash if the primary model returned 404
+    if (!response.ok && response.status === 404 && cleanModel !== "models/gemini-2.0-flash") {
+      console.log("Retrying with models/gemini-2.0-flash...");
+      cachedModel = "models/gemini-2.0-flash";
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: systemInstruction }] }],
+          }),
+        }
+      );
+      data = await response.json();
     }
 
-    const botReply = data.candidates?.[0]?.content?.parts?.[0]?.text || "Let's work out! 💪";
-    
-    res.json({ reply: botReply });
+    if (!response.ok) {
+      cachedModel = null;
+      console.error("Google API Error:", JSON.stringify(data));
+      throw new Error(data.error?.message || "Google API Error");
+    }
 
+    const botReply =
+      data.candidates?.[0]?.content?.parts?.[0]?.text || "Let's work out! 💪";
+
+    res.json({ reply: botReply });
   } catch (error) {
     console.error("❌ AI Controller Error:", error.message);
     res.status(500).json({ reply: "My brain is buffering 🧠. Please try again!" });
